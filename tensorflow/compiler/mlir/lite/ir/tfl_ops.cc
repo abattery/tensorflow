@@ -134,6 +134,22 @@ bool IsQI16Type(Type element_type) {
          quantized_type.isSigned();
 }
 
+// Return true when the given element_type is QI32.
+inline bool IsQI32Type(Type t) {
+  auto quantized_type = quant::QuantizedType::getQuantizedElementType(t);
+  return quantized_type != nullptr &&
+         quantized_type.getStorageTypeIntegralWidth() == 32 &&
+         quantized_type.isSigned();
+}
+
+// Return true when the given element_type is QI64.
+inline bool IsQI64Type(Type t) {
+  auto quantized_type = quant::QuantizedType::getQuantizedElementType(t);
+  return quantized_type != nullptr &&
+         quantized_type.getStorageTypeIntegralWidth() == 64 &&
+         quantized_type.isSigned();
+}
+
 // Return true when the given element_type is I32.
 bool IsI32Type(Type element_type) {
   return element_type.isInteger(32) && !element_type.isUnsignedInteger();
@@ -784,9 +800,80 @@ static LogicalResult Verify(CustomOp op) {
 
 LogicalResult Verify(FullyConnectedOp op) {
   ShapedType input_type = op.input().getType().cast<ShapedType>();
+  ShapedType output_type = op.output()[0].getType().cast<ShapedType>();
   ShapedType filter_type = op.filter().getType().cast<ShapedType>();
   if (filter_type.hasRank() && filter_type.getRank() != 2) {
     return op.emitOpError("expect 2d filter, got ") << filter_type;
+  }
+
+  Type input_element_type = getElementTypeOrSelf(input_type);
+  Type output_element_type = getElementTypeOrSelf(output_type);
+  Type filter_element_type = getElementTypeOrSelf(filter_type);
+
+  const bool has_bias = !op.bias().getType().isa<mlir::NoneType>();
+  Type bias_element_type = getElementTypeOrSelf(op.bias().getType());
+
+  const bool is_quantized =
+      IsQUI8Type(filter_element_type) || IsQI8Type(filter_element_type);
+  const bool is_hybrid = is_quantized && input_element_type.isF32();
+  const bool is_shuffled =
+      is_quantized && (op.weights_format() == "SHUFFLED4x16INT8");
+
+  // optional bias tensor.
+  const bool is_optional_bias_float =
+      !has_bias || bias_element_type.isF32() || bias_element_type.isBF16();
+  const bool is_optional_bias_int = !has_bias ||
+                                    IsQI32Type(bias_element_type) ||
+                                    IsQI64Type(bias_element_type);
+
+  if (is_quantized) {
+    if (is_shuffled) {
+      if (!IsQUI8Type(input_element_type) || !IsQUI8Type(filter_element_type) ||
+          !IsQI16Type(output_element_type) || !is_optional_bias_int) {
+        return op.emitOpError(
+                   "requires QUI8 input, QUI8 filter, QI16 output and "
+                   "quantized integer bias, got ")
+               << input_element_type << " input, " << filter_element_type
+               << " filter, " << output_element_type << " output, "
+               << bias_element_type << "bias";
+      }
+    } else if (is_hybrid) {
+      if (!input_element_type.isF32() || !output_element_type.isF32() ||
+          !is_optional_bias_float) {
+        return op.emitOpError("requires float input, filter, and bias, got")
+               << input_element_type << " input, " << filter_element_type
+               << " filter, " << output_element_type << " output, "
+               << bias_element_type << "bias";
+      }
+    } else {
+      if (!(IsQUI8Type(input_element_type) || IsQI8Type(input_element_type) ||
+            IsQI16Type(input_element_type))) {
+        return op.emitOpError("requires QI8, QUI8, or QI16 input, got ")
+               << input_element_type << " input";
+      }
+      if (!(IsQUI8Type(output_element_type) || IsQI8Type(output_element_type) ||
+            IsQI16Type(output_element_type))) {
+        return op.emitOpError("requires QUI8, QI8, or QI16 output, got ")
+               << output_element_type << " output";
+      }
+      if (!is_optional_bias_int) {
+        return op.emitOpError("requires quantized integer bias, got ")
+               << bias_element_type << " bias";
+      }
+    }
+  } else {
+    // Only float32 and bf16 are supported currently
+    if (!(((input_element_type.isF32() && output_element_type.isF32() &&
+            filter_element_type.isF32()) ||
+           (input_element_type.isBF16() && output_element_type.isBF16() &&
+            filter_element_type.isBF16())) &&
+          is_optional_bias_float)) {
+      return op.emitOpError(
+                 "requires float input, filter, output, and bias, got ")
+             << input_element_type << " input, " << filter_element_type
+             << " filter, " << output_element_type << " output, "
+             << bias_element_type << "bias";
+    }
   }
 
   if (!input_type.hasStaticShape() || !filter_type.hasStaticShape()) {
